@@ -35,6 +35,7 @@ object JisuanChigubiliByGraph {
 	case class XuniId(id:Long, name:String)
 	case class EdgeAttr(percent:Double, amount:Double, total:Double)
 	
+	//持股比例的保存结果的表
   val resultTable = "statistics.chigu_bili"
   //顶点的属性，分别代表name和md5
 	case class VtxAttr(company_name:String, company_md5:String)
@@ -56,7 +57,7 @@ object JisuanChigubiliByGraph {
     val spark = SparkSession.builder().master(ConfigUtil.master).appName("JisuanChiguBili").config("spark.sql.warehouse.dir", ConfigUtil.warehouse).master(ConfigUtil.master).getOrCreate()
     import spark.implicits._
     val biliDS = generateBasicDS(spark).persist()
-    HDFSUtil.saveDSToHDFS("/home/data_center/biliDS_new", biliDS, SaveMode.Overwrite)
+//    HDFSUtil.saveDSToHDFS("/home/data_center/graphx/biliDS_new", biliDS, SaveMode.Overwrite)
 //    DBUtil.saveDFToDB(biliDS, "test.bili_dataset")
 //		val basicRDD = generateBasicDS(spark).rdd
     val basicRDD = biliDS.rdd
@@ -98,13 +99,17 @@ object JisuanChigubiliByGraph {
     DBUtil.saveDFToDB(resultDF, resultTable)
   }
   
+  /**
+   * 计算企业所投资企业的额度以及所占的比例的数据集。
+   */
   def generateBasicDS(spark:SparkSession):Dataset[BiliStructure] = {
     import spark.implicits._
     
-    //gudong_id, gudong_name, md5
+    //获取企业信息（不包含个体户）。这部分数据一般一次从数据库中获取出来保存到HDFS中，供多个application使用
     val companyDF = HDFSUtil.loadCompanyNoGetiBasic(spark).select("id", "name", "md5")
     companyDF.createOrReplaceTempView("company")
     //reportId, companyId, year
+    //获取所有的报表信息。
     val reportInfo = DBUtil.loadDFFromTable("dc_import.company_report_base", 32, spark).select("id", "company_id", "year").map(x => {
       val yearStr = x.getAs[String]("year")
 	    val year = if(yearStr == null || yearStr.trim().isEmpty()) null else yearStr.replaceAll("[^\\d]", "").trim()
@@ -123,16 +128,18 @@ object JisuanChigubiliByGraph {
 			  r2
 	  }}.map(x => x._2)
 
+	  //整理报表中的股东出资的信息
 	  //report_id, act_amount, name
 	  val investDF = DBUtil.loadDFFromTable("dc_import.company_report_stock_investment", 32, spark).select("report_id", "act_amount", "name").filter(x => (x.getAs[String]("act_amount") != null && x.getAs[String]("act_amount").trim().length() != 0))
 	  
 	  //reportId, amount, name
+	  //将出资信息的文本转换成一个实际的数字
 	  val invInfo = investDF.map(x => {
 	    ReportInvestInfo(x.getAs[Long]("report_id"), trimNumFromLeft(x.getAs[String]("act_amount")), x.getAs[String]("name"))
 	  }).filter(x => x.amount != 0)
 	  
 //	  val reportInfo1 = DBUtil.loadDFFromTable("dc_import.company_report_base", 12, spark).select("id", "company_id", "year").groupBy("company_id").agg(max(struct("year")) as "event").select("id")
-	  val reportInfo1 = DBUtil.loadDFFromTable("dc_import.company_report_base", 32, spark).select("id", "company_id", "year").groupBy("company_id").agg(max(struct("year", "id")) as "max").select("company_id", "max.*")
+//	  val reportInfo1 = DBUtil.loadDFFromTable("dc_import.company_report_base", 32, spark).select("id", "company_id", "year").groupBy("company_id").agg(max(struct("year", "id")) as "max").select("company_id", "max.*")
 	  //计算出企业的各个股东持股比例
 	  val biliDF = filterReport.join(invInfo, "reportId").select("companyId", "name", "amount").persist()
 	  val sumAmount = biliDF.groupBy("companyId").sum("amount").withColumnRenamed("sum(amount)", "sum")
@@ -152,7 +159,7 @@ object JisuanChigubiliByGraph {
     
     stockChangeDS.filter(x => x.company_id == 10990).show
     
-//    val stockIdSet = stockChangeDS.map { x => x.company_id }.distinct().collectAsList()
+    //将两部分数据进行合并
     val biliDS = reportBiliDS.union(stockChangeDS).groupByKey{ x => x.company_id }.flatMapGroups[Bili]{(companyId:Long, it:Iterator[BiliWithTag]) => {
       //如果有股权变更的信息，就用股权变更的信息
       val resultSet = it.toSet
@@ -166,6 +173,7 @@ object JisuanChigubiliByGraph {
     
 	  biliDS.createOrReplaceTempView("bili_info")
 	  
+	  //获取计算所得的企业股权比例信息
 	  val biliWithCompany = spark.sql("select c1.id as company_id, c1.name as company_name, c1.md5 as company_md5, bi.gudong_name, c2.id as gudong_id, c2.md5 as gudong_md5, bi.percent, bi.amount, bi.total "
 	      +"from company c1 inner join bili_info bi on c1.id = bi.company_id "
 	      +"left join company c2 on bi.gudong_name = c2.name").as[BiliStructure].persist()
@@ -173,14 +181,17 @@ object JisuanChigubiliByGraph {
 	  biliDF.unpersist()
 	  
 	  biliWithCompany.createOrReplaceTempView("basic_bili_info")
+	  //给没有唯一id的股东生成一个id，值是负值。
 		val standaloneNamesDF = spark.sql("select distinct(gudong_name) as gudong_name from basic_bili_info t where t.gudong_id is null").withColumn("id", monotonically_increasing_id).map { x =>{
       val id = x.getAs[Long]("id")
       val dst_name = x.getAs[String]("gudong_name")
       XuniId((id+1)*(-1), dst_name)
     } }
     standaloneNamesDF.createOrReplaceTempView("xuni_id")
+    
     val sql = "select t.*, x.id as xuni_id from basic_bili_info t left join xuni_id x on t.gudong_name = x.name"
     
+    //将原有的股权比例信息和id为负数的数据集进行关联，确保每个顶点都有一个唯一id。
     val ds = spark.sql(sql).mapPartitions { it => it.map { x => {
       val gudong_id = x.getAs[Long]("gudong_id")
       if(gudong_id == 0){
@@ -193,16 +204,23 @@ object JisuanChigubiliByGraph {
     ds
   }
   
+  /**
+   * 根据计算出的企业的股权比例信息生成图。
+   */
   def generateGraph(basicRDD:RDD[BiliStructure]):Graph[VtxAttr, EdgeAttr] = {
+    //生成顶点RDD
     val vertices:RDD[(VertexId,VtxAttr)] = basicRDD.flatMap {
       g => List(
         (g.company_id,VtxAttr(g.company_name, g.company_md5)),
         (g.gudong_id,VtxAttr(g.gudong_name, g.gudong_md5))
       )
     }
+    
+    //生成边RDD。
     //边的方向：从股东指向边；属性：percent，amount，total
     val edges = basicRDD.map { g => Edge(g.gudong_id, g.company_id, EdgeAttr(g.percent, g.amount, g.total)) }
     
+    //组装图对象
     val graph = Graph(vertices, edges)
     
     graph

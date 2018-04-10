@@ -13,8 +13,8 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.Row
 
 /**
- * 与JisuanTouziTu算法一致，区别是把SparkSession的初始化放到main方法中，避免异常。
- * 462638,1900771,2004173,2022491,2067356
+ * 计算企业的投资关系。
+ * 
  */
 
 object JisuanTouziTuImprove {
